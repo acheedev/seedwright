@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -77,6 +78,80 @@ class ConfiguredOracleCliTests(unittest.TestCase):
 
         self.assertIn("[oracle].host", str(ctx.exception))
         self.assertIn("[oracle].service_name", str(ctx.exception))
+
+
+class ConfiguredPostgresCliTests(unittest.TestCase):
+    def _config_file(self, text: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_postgres_connection_comes_from_config_parts(self):
+        path = self._config_file(
+            "[postgres]\n"
+            "host = postgres.example.test\n"
+            "port = 5433\n"
+            "dbname = app\n"
+            "user = scott\n"
+            "password = tiger\n"
+            "schema = app\n"
+        )
+        args = build_parser().parse_args(["--dialect", "postgres", "--config", path])
+
+        dialect = _make_dialect(args)
+
+        self.assertEqual(
+            dialect.dsn,
+            "host=postgres.example.test port=5433 dbname=app user=scott password=tiger",
+        )
+        self.assertEqual(dialect.schema, "app")
+
+    def test_postgres_dsn_config_is_supported(self):
+        path = self._config_file(
+            "[postgres]\n"
+            "dsn = postgresql://scott:tiger@postgres.example.test:5432/app\n"
+        )
+        args = build_parser().parse_args(["--dialect", "postgres", "--config", path])
+
+        dialect = _make_dialect(args)
+
+        self.assertEqual(
+            dialect.dsn,
+            "postgresql://scott:tiger@postgres.example.test:5432/app",
+        )
+        self.assertEqual(dialect.schema, "public")
+
+    def test_postgres_dsn_and_schema_can_override_config(self):
+        path = self._config_file("[postgres]\ndsn = ignored\nschema = ignored\n")
+        args = build_parser().parse_args([
+            "--dialect",
+            "postgres",
+            "--config",
+            path,
+            "--postgres-dsn",
+            "host=override dbname=app user=scott password=tiger",
+            "--postgres-schema",
+            "app",
+        ])
+
+        dialect = _make_dialect(args)
+
+        self.assertEqual(
+            dialect.dsn,
+            "host=override dbname=app user=scott password=tiger",
+        )
+        self.assertEqual(dialect.schema, "app")
+
+    def test_postgres_requires_connection_details(self):
+        path = self._config_file("[postgres]\nhost = postgres.example.test\n")
+        args = build_parser().parse_args(["--dialect", "postgres", "--config", path])
+
+        with self.assertRaises(SystemExit) as ctx:
+            _make_dialect(args)
+
+        self.assertIn("dialect=postgres requires", str(ctx.exception))
 
 
 class CliValidationTests(unittest.TestCase):
@@ -188,6 +263,92 @@ class CliValidationTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             _log_level(config)
+
+    def test_apply_requires_validate_db_for_sqlite(self):
+        config_path = self._config_file("")
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(db_path) and os.remove(db_path))
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+        conn.close()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                main([
+                    "--db",
+                    db_path,
+                    "--config",
+                    config_path,
+                    "--rows",
+                    "1",
+                    "--apply",
+                ])
+
+        self.assertIn("--validate-db", str(ctx.exception))
+
+    def test_apply_uses_dialect_validation_and_apply_hooks(self):
+        config_path = self._config_file("")
+        fd, out_path = tempfile.mkstemp(suffix=".sql")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(out_path) and os.remove(out_path))
+
+        schema = Schema()
+        schema.add(Table("customers", [
+            Column("id", type="integer", primary_key=True, nullable=False),
+        ]))
+
+        class Result:
+            tables = 1
+            rows = 1
+
+        class FakeDialect:
+            def __init__(self):
+                self.validated = None
+                self.applied = False
+
+            def introspect(self):
+                return schema
+
+            def quote_identifier(self, identifier):
+                return '"' + identifier + '"'
+
+            def quote_literal(self, value):
+                return str(value)
+
+            def quote_column_literal(self, value, column):
+                return self.quote_literal(value)
+
+            def validate_script(self, validation_target, table_names, sql):
+                self.validated = (validation_target, table_names, sql)
+                return Result()
+
+            def apply_script(self, sql):
+                self.applied = True
+
+        dialect = FakeDialect()
+        with patch("seedwright.cli._make_dialect", return_value=dialect):
+            with patch("builtins.input", return_value="yes"):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc = main([
+                        "--db",
+                        "ignored.db",
+                        "--config",
+                        config_path,
+                        "--rows",
+                        "1",
+                        "--out",
+                        out_path,
+                        "--apply",
+                        "--validate-db",
+                        "validation-target",
+                    ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(dialect.validated[0], "validation-target")
+        self.assertEqual(dialect.validated[1], ["customers"])
+        self.assertIn('INSERT INTO "customers"', dialect.validated[2])
+        self.assertTrue(dialect.applied)
 
 
 if __name__ == "__main__":

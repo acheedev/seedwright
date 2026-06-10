@@ -19,7 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 from ..model import Column, ForeignKey, Schema, Table
-from .base import Dialect
+from .base import Dialect, ValidationResult
 
 _TYPE_ARGS_RE = re.compile(r"\((\d+)(?:\s*,\s*(-?\d+))?")
 
@@ -146,6 +146,81 @@ class SQLiteDialect(Dialect):
             value = value.isoformat()
         return "'" + str(value).replace("'", "''") + "'"
 
+    def validate_script(
+        self,
+        validation_target: str,
+        table_names: list[str],
+        sql: str,
+    ) -> ValidationResult:
+        """Run generated SQL against an existing SQLite validation DB and roll it back."""
+        conn = sqlite3.connect(validation_target)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            before = _count_rows(conn, table_names)
+            conn.execute("BEGIN")
+            for statement in _split_sql_script(sql):
+                try:
+                    conn.execute(statement)
+                except sqlite3.IntegrityError as exc:
+                    if "FOREIGN KEY" in str(exc).upper():
+                        raise RuntimeError(
+                            f"foreign-key violations in validation database: {exc}"
+                        ) from exc
+                    raise RuntimeError(
+                        f"validation database rejected generated SQL: {exc}"
+                    ) from exc
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"foreign-key violations in validation database: {violations}"
+                )
+            after = _count_rows(conn, table_names)
+            return ValidationResult(tables=len(table_names), rows=after - before)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def apply_script(self, sql: str) -> None:
+        """Run generated SQL against the configured SQLite database in one transaction."""
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN")
+            for statement in _split_sql_script(sql):
+                conn.execute(statement)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
 
 def _q(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def _count_rows(conn: sqlite3.Connection, table_names: list[str]) -> int:
+    return sum(
+        conn.execute(f"SELECT COUNT(*) FROM {_q(name)}").fetchone()[0]
+        for name in table_names
+    )
+
+
+def _split_sql_script(sql: str) -> list[str]:
+    statements: list[str] = []
+    pending = ""
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        pending += line + "\n"
+        if sqlite3.complete_statement(pending):
+            statements.append(pending.strip().rstrip(";"))
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("SQL script ended with an incomplete statement")
+    return statements

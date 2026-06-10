@@ -16,6 +16,8 @@ from .config import app_config, config_value, dialect_config, load_config
 from .dialects import SQLiteDialect
 from .emit import to_csv, to_sql
 from .engine import GenerationEngine
+from .model import Schema
+from .schema_filter import read_table_list, restrict_schema
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _LOG_LEVELS = {"quiet": 0, "info": 1, "debug": 2}
@@ -65,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate referentially-correct synthetic data from a live schema.",
     )
     p.add_argument(
-        "--dialect", choices=["sqlite", "oracle"], default="sqlite",
+        "--dialect", choices=["sqlite", "oracle", "postgres"], default="sqlite",
         help="which database to introspect (default: sqlite)",
     )
     p.add_argument(
@@ -81,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--oracle-password",
         help="Oracle password override; otherwise [oracle].password from config",
+    )
+    p.add_argument(
+        "--postgres-dsn",
+        help="Postgres connection string override; otherwise [postgres].dsn from config",
+    )
+    p.add_argument(
+        "--postgres-schema",
+        help="Postgres schema override; otherwise [postgres].schema or public",
     )
     p.add_argument(
         "--rows",
@@ -100,6 +110,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", help="output file for SQL (default: stdout)")
     p.add_argument("--out-dir", help="output directory for CSV (one file per table)")
+    p.add_argument(
+        "--tables-file",
+        help="restrict generation to tables listed one per line; defaults to all tables",
+    )
+    p.add_argument(
+        "--review-sql",
+        action="store_true",
+        help="print generated SQL before validation/apply continues",
+    )
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="validate SQL in a user-provided target, then prompt before applying to the source database",
+    )
+    p.add_argument(
+        "--validate-db",
+        help="existing validation target for --apply; changes are rolled back when the dialect supports it",
+    )
     return p
 
 
@@ -127,6 +155,20 @@ def _make_dialect(args):
         assert password is not None
         assert dsn is not None
         return OracleDialect(user, password, dsn)
+
+    if args.dialect == "postgres":
+        postgres_config = dialect_config(config, "postgres")
+        dsn = config_value(postgres_config, "dsn", args.postgres_dsn)
+        schema = config_value(postgres_config, "schema", args.postgres_schema) or "public"
+        if not dsn:
+            dsn = _postgres_dsn(postgres_config)
+        if not dsn:
+            raise SystemExit(
+                "dialect=postgres requires [postgres].dsn or "
+                "[postgres].host, [postgres].dbname, [postgres].user, [postgres].password"
+            )
+        from .dialects import PostgresDialect
+        return PostgresDialect(dsn, schema)
 
     if not args.db:
         raise SystemExit("dialect=sqlite requires --db")
@@ -158,6 +200,20 @@ def _oracle_dsn(config) -> str | None:
     return f"{host}:{port}/{service_name}"
 
 
+def _postgres_dsn(config) -> str | None:
+    host = config.get("host")
+    dbname = config.get("dbname")
+    user = config.get("user")
+    password = config.get("password")
+    if not all((host, dbname, user, password)):
+        return None
+    port = config.get("port", "5432")
+    return (
+        f"host={host} port={port} dbname={dbname} "
+        f"user={user} password={password}"
+    )
+
+
 def _validate_table_rows(schema, per_table: dict[str, int]) -> None:
     unknown = sorted(name for name in per_table if name not in schema.tables)
     if unknown:
@@ -167,6 +223,61 @@ def _validate_table_rows(schema, per_table: dict[str, int]) -> None:
             + ", ".join(unknown)
             + (f". known tables: {known}" if known else "")
         )
+
+
+def _prompt_yes_no(prompt: str) -> bool:
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _filter_schema(schema: Schema, tables_file: str | None) -> tuple[Schema, list[str] | None]:
+    if not tables_file:
+        return schema, None
+    try:
+        table_names = read_table_list(tables_file)
+    except OSError as exc:
+        raise SystemExit(f"could not read --tables-file: {exc}") from exc
+    if not table_names:
+        raise SystemExit("--tables-file did not contain any table names")
+    try:
+        return restrict_schema(schema, table_names), table_names
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _validate_and_apply(args, dialect, schema, sql: str, total_rows: int) -> int:
+    if args.format != "sql":
+        raise SystemExit("--apply is only supported with --format sql")
+    if not args.validate_db:
+        raise SystemExit("--apply requires --validate-db")
+
+    print(f"seedwright: validating SQL against {args.validate_db}", file=sys.stderr)
+    try:
+        result = dialect.validate_script(args.validate_db, list(schema.tables), sql)
+    except NotImplementedError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        f"seedwright: throwaway validation loaded {result.rows} row(s) "
+        f"across {result.tables} table(s)",
+        file=sys.stderr,
+    )
+    if result.rows != total_rows:
+        raise SystemExit(
+            "throwaway validation row count did not match generated row count: "
+            f"{result.rows} != {total_rows}"
+        )
+    if not _prompt_yes_no("Apply this SQL to the source database? [y/N] "):
+        print("seedwright: apply denied; source database unchanged", file=sys.stderr)
+        return 0
+    try:
+        dialect.apply_script(sql)
+    except NotImplementedError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"seedwright: applied {total_rows} row(s)", file=sys.stderr)
+    return 0
 
 
 def _safe_csv_filename(table_name: str, used: set[str]) -> str:
@@ -195,11 +306,18 @@ def main(argv: list[str] | None = None) -> int:
     dialect = _make_dialect(args)
     _log("seedwright: introspecting schema", log_level, log_stream)
     schema = dialect.introspect()
+    schema, requested_tables = _filter_schema(schema, args.tables_file)
     if len(schema) == 0:
         print("no tables found in database", file=sys.stderr)
         return 1
     _validate_table_rows(schema, args.table_rows)
     _log(f"seedwright: found {len(schema)} table(s)", log_level, log_stream)
+    if requested_tables is not None:
+        _log(
+            f"seedwright: restricted by {args.tables_file}",
+            log_level,
+            log_stream,
+        )
     _log(
         "seedwright: tables: " + ", ".join(sorted(schema.tables)),
         log_level,
@@ -229,14 +347,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "sql":
         _log("seedwright: rendering SQL", log_level, log_stream)
         sql = to_sql(schema, data, dialect)
+        if args.review_sql:
+            print(sql)
+            if args.apply and not _prompt_yes_no("Continue after reviewing SQL? [y/N] "):
+                print("seedwright: apply denied after SQL review", file=sys.stderr)
+                return 0
         if args.out:
             _log(f"seedwright: writing SQL to {args.out}", log_level, log_stream)
             with open(args.out, "w") as fh:
                 fh.write(sql)
             print(f"wrote {total_rows} rows to {args.out}", file=sys.stderr)
         else:
-            print(sql)
+            if not args.review_sql:
+                print(sql)
+        if args.apply:
+            return _validate_and_apply(args, dialect, schema, sql, total_rows)
     else:
+        if args.apply:
+            raise SystemExit("--apply is only supported with --format sql")
         out_dir = args.out_dir or "."
         _log(f"seedwright: writing CSV files to {out_dir}", log_level, log_stream)
         os.makedirs(out_dir, exist_ok=True)
