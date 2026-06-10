@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seedwright"
+version = "0.1.0"
+description = "Referentially-correct synthetic data generated from a live database schema."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []  # core runs on the standard library alone
+
+[project.optional-dependencies]
+faker = ["faker>=24"]        # richer names / addresses / sentences
+numpy = ["numpy>=1.24"]      # vectorized, skewed numeric distributions
+postgres = ["sqlalchemy>=2", "psycopg[binary]>=3"]  # for a future PostgresDialect
+oracle = ["sqlalchemy>=2", "oracledb>=2"]            # for a future OracleDialect
+dev = ["pytest>=8"]
+
+[project.scripts]
+seedwright = "seedwright.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["seedwright*"]
