@@ -38,7 +38,7 @@ class EmitTests(unittest.TestCase):
 
     def test_csv_roundtrip_headers(self):
         rows = [{"id": 1, "label": "a"}, {"id": 2, "label": "b"}]
-        out = to_csv("t", rows)
+        out = to_csv(rows)
         self.assertTrue(out.startswith("id,label"))
         self.assertEqual(out.strip().count("\n"), 2)  # header + 2 rows - 1
 

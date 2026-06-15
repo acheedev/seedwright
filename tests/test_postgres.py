@@ -18,29 +18,29 @@ from seedwright.dialects.postgres import (
 
 class PostgresTypeMappingTests(unittest.TestCase):
     def test_integer_types(self):
-        self.assertEqual(normalize_postgres_type("integer", "int4", None, None, None), ("integer", None))
-        self.assertEqual(normalize_postgres_type("bigint", "int8", None, None, None), ("integer", None))
+        self.assertEqual(normalize_postgres_type("integer", "int4", None, None), ("integer", None))
+        self.assertEqual(normalize_postgres_type("bigint", "int8", None, None), ("integer", None))
 
     def test_numeric_scale_zero_is_integer(self):
-        self.assertEqual(normalize_postgres_type("numeric", "numeric", 10, 0, None), ("integer", None))
+        self.assertEqual(normalize_postgres_type("numeric", "numeric", 0, None), ("integer", None))
 
     def test_numeric_with_scale_is_numeric(self):
-        self.assertEqual(normalize_postgres_type("numeric", "numeric", 10, 2, None), ("numeric", None))
+        self.assertEqual(normalize_postgres_type("numeric", "numeric", 2, None), ("numeric", None))
 
     def test_text_types_keep_length(self):
         self.assertEqual(
-            normalize_postgres_type("character varying", "varchar", None, None, 40),
+            normalize_postgres_type("character varying", "varchar", None, 40),
             ("text", 40),
         )
 
     def test_temporal_boolean_and_blob_types(self):
-        self.assertEqual(normalize_postgres_type("boolean", "bool", None, None, None), ("boolean", None))
-        self.assertEqual(normalize_postgres_type("date", "date", None, None, None), ("date", None))
+        self.assertEqual(normalize_postgres_type("boolean", "bool", None, None), ("boolean", None))
+        self.assertEqual(normalize_postgres_type("date", "date", None, None), ("date", None))
         self.assertEqual(
-            normalize_postgres_type("timestamp without time zone", "timestamp", None, None, None),
+            normalize_postgres_type("timestamp without time zone", "timestamp", None, None),
             ("datetime", None),
         )
-        self.assertEqual(normalize_postgres_type("bytea", "bytea", None, None, None), ("blob", None))
+        self.assertEqual(normalize_postgres_type("bytea", "bytea", None, None), ("blob", None))
 
 
 class PostgresAssembleTests(unittest.TestCase):

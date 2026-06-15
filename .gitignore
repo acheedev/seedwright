@@ -10,3 +10,5 @@ seed_csv/
 .pytest_cache/
 sandbox_env.txt
 seedwright.ini
+examples/api*
+logs/
