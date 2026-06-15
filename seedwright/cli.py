@@ -379,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
                 required=2,
             )
             with open(path, "w", newline="") as fh:
-                fh.write(to_csv(tname, rows))
+                fh.write(to_csv(rows))
         print(f"wrote {len(data)} CSV files to {out_dir}", file=sys.stderr)
     return 0
 

@@ -44,7 +44,7 @@ def to_sql(
     return "\n".join(lines)
 
 
-def to_csv(table_name: str, rows: list[dict[str, Any]]) -> str:
+def to_csv(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return ""
     buf = io.StringIO()

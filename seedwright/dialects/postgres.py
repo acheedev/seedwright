@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from ..model import Column, ForeignKey, Schema, Table
 from .base import Dialect, ValidationResult
 
 try:  # optional dependency; importing the module should not require psycopg
     import psycopg
+    from psycopg import sql as pg_sql
 except ImportError:  # pragma: no cover
     psycopg = None
+    pg_sql: Any = None
 
 
 def normalize_postgres_type(
     data_type: str,
     udt_name: str,
-    numeric_precision: Optional[int],
     numeric_scale: Optional[int],
     char_length: Optional[int],
 ) -> tuple[str, Optional[int]]:
@@ -102,7 +103,6 @@ def assemble_schema(
         ntype, length = normalize_postgres_type(
             data_type,
             udt_name,
-            precision,
             scale,
             char_length,
         )
@@ -268,7 +268,7 @@ class PostgresDialect(Dialect):
                 self._set_search_path(cur)
                 before = self._count_rows(cur, table_names)
                 for statement in _split_sql_script(sql):
-                    cur.execute(statement)
+                    cur.execute(_trusted_sql(statement))
                 cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
                 after = self._count_rows(cur, table_names)
                 conn.rollback()
@@ -290,7 +290,7 @@ class PostgresDialect(Dialect):
             with conn.cursor() as cur:
                 self._set_search_path(cur)
                 for statement in _split_sql_script(sql):
-                    cur.execute(statement)
+                    cur.execute(_trusted_sql(statement))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -323,3 +323,9 @@ def _split_sql_script(sql: str) -> list[str]:
     if pending.strip():
         raise RuntimeError("SQL script ended with an incomplete statement")
     return statements
+
+
+def _trusted_sql(statement: str) -> Any:
+    if pg_sql is None:
+        return statement
+    return pg_sql.SQL(cast(Any, statement))
