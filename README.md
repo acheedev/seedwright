@@ -75,11 +75,16 @@ tool does not create or drop the throwaway database; you own that setup. The
 core CLI does not contain database-specific execution logic; validation and
 apply are dialect hooks.
 
-For Postgres, pass a validation connection string instead:
+For Postgres, put the validation connection string in `seedwright.ini` so
+credentials do not land in shell history:
+
+```ini
+[postgres]
+validation_dsn = host=localhost dbname=app_throwaway user=scott password=tiger
+```
 
 ```bash
 python -m seedwright --dialect postgres --config seedwright.ini \
-    --validate-db "host=localhost dbname=app_throwaway user=scott password=tiger" \
     --review-sql \
     --apply
 ```
@@ -100,7 +105,7 @@ python -m seedwright --db servicedesk.db --seed 5 \
 live schema
   -> Dialect.introspect()   reads tables, columns, types, PKs, FKs, uniques
   -> optional table filter  keeps all tables by default, or a FK-closed allow-list
-  -> topological_order()    sorts tables so parents come before children
+  -> dependency_plan()      sorts tables and defers nullable cycle-breaking FKs
   -> GenerationEngine       generates rows; FK columns draw from real parent PKs
   -> emit.to_sql / to_csv   renders, parents first, ready to load
 ```
@@ -119,7 +124,7 @@ Schema shapes it handles:
 - self-references (`employees.manager_id -> employees.id`)
 - nullable foreign keys (sometimes filled, sometimes `NULL`)
 - single-column unique constraints (no collisions)
-- true cross-table cycles — **detected and reported**, not silently mangled
+- nullable cross-table cycles (insert `NULL`, then second-pass `UPDATE`)
 
 ## Values that read like real data
 
@@ -199,10 +204,12 @@ dbname = app
 user = scott
 password = tiger
 schema = public
+validation_dsn = postgresql://scott:tiger@postgres.example.test:5432/app_validation
 ```
 
 For Postgres, you can also replace the individual connection fields with a
-single `[postgres].dsn` value if you prefer a psycopg connection string.
+single `[postgres].dsn` value if you prefer a psycopg connection string. The
+Postgres source DSN is intentionally config-only; there is no CLI flag for it.
 
 Global CLI settings live in `[seedwright]`:
 
@@ -222,7 +229,7 @@ python -m unittest discover -s tests     # standard library, no install
 pip install -e ".[dev]" && pytest
 ```
 
-Coverage: dependency ordering (including self-reference and cycle detection),
+Coverage: dependency ordering (including self-reference and cycle resolution),
 value generation (types, uniqueness, seed reproducibility), end-to-end FK
 integrity against a loaded in-memory database, and emitter escaping.
 

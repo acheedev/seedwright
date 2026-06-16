@@ -7,11 +7,13 @@ For each table, in dependency order:
    is generated and de-duplicated. UNIQUE columns are also de-duplicated per
    table, across all generated value types.
 3. Fill non-key columns from the `ValueFactory`.
-4. For every foreign-key column, draw a value from the *actual* primary keys
+4. For every non-deferred foreign-key column, draw a value from the *actual* primary keys
    already generated for the parent table. That draw is the referential
    integrity: a child can only ever point at a parent row that exists.
    Self-referencing FKs draw from earlier rows of the same table. Nullable
    self-FKs can become NULL; required first-row self-FKs point at the row itself.
+5. For nullable FK groups chosen to break cross-table cycles, insert NULL first
+   and record second-pass UPDATEs once both sides of the cycle exist.
 
 The result is an ordered dict of table -> list[row dict], ready for any emitter.
 """
@@ -21,8 +23,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .generators import ValueFactory
-from .graph import topological_order
-from .model import Column, Schema, Table
+from .graph import dependency_plan
+from .model import Column, DeferredForeignKey, DeferredUpdate, GeneratedData, Schema, Table
 
 Row = dict[str, Any]
 
@@ -43,15 +45,21 @@ class GenerationEngine:
         self._pk_pool: dict[str, list[Any]] = {}
         # parent table -> generated rows, for composite FK draws
         self._rows_by_table: dict[str, list[Row]] = {}
+        self._deferred_fk_keys: set[tuple[str, tuple[str, ...]]] = set()
 
-    def generate(self) -> dict[str, list[Row]]:
-        out: dict[str, list[Row]] = {}
-        for tname in topological_order(self.schema):
+    def generate(self) -> GeneratedData:
+        plan = dependency_plan(self.schema)
+        self._deferred_fk_keys = {
+            (fk.table, fk.columns) for fk in plan.deferred_fks
+        }
+        out = GeneratedData()
+        for tname in plan.order:
             table = self.schema[tname]
             rows = self._generate_table(table)
             out[tname] = rows
             self._pk_pool[tname] = [self._pk_value(table, r) for r in rows]
             self._rows_by_table[tname] = rows
+        out.deferred_updates = self._build_deferred_updates(plan.deferred_fks)
         return out
 
     def _rows_for(self, tname: str) -> int:
@@ -186,6 +194,10 @@ class GenerationEngine:
     ) -> None:
         fk = group[0].foreign_key
         assert fk is not None
+        if (table.name, tuple(col.name for col in group)) in self._deferred_fk_keys:
+            self._set_fk_group_null(row, group)
+            return
+
         can_be_null = any(c.nullable for c in group)
 
         if fk.ref_table == table.name:
@@ -244,6 +256,66 @@ class GenerationEngine:
     def _set_fk_group_null(row: Row, group: list[Column]) -> None:
         for col in group:
             row[col.name] = None
+
+    def _build_deferred_updates(
+        self,
+        deferred_fks: list[DeferredForeignKey],
+    ) -> list[DeferredUpdate]:
+        updates: list[DeferredUpdate] = []
+        for deferred_fk in deferred_fks:
+            child = self.schema[deferred_fk.table]
+            parent_rows = self._rows_by_table.get(deferred_fk.ref_table, [])
+            child_rows = self._rows_by_table.get(deferred_fk.table, [])
+            if not child_rows or not parent_rows:
+                continue
+            if not child.primary_keys:
+                raise ValueError(
+                    f"{child.name}.{', '.join(deferred_fk.columns)} is deferred, "
+                    "but second-pass updates require a primary key on the child table"
+                )
+
+            assignments = self._choose_deferred_assignments(
+                child,
+                deferred_fk,
+                child_rows,
+                parent_rows,
+            )
+            for row, assigned in assignments:
+                if not assigned:
+                    continue
+                updates.append(
+                    DeferredUpdate(
+                        table=child.name,
+                        key_columns=tuple(col.name for col in child.primary_keys),
+                        key_values=tuple(row[col.name] for col in child.primary_keys),
+                        assignments=tuple(assigned),
+                    )
+                )
+        return updates
+
+    def _choose_deferred_assignments(
+        self,
+        child: Table,
+        deferred_fk: DeferredForeignKey,
+        child_rows: list[Row],
+        parent_rows: list[Row],
+    ) -> list[tuple[Row, list[tuple[str, Any]]]]:
+        columns = [child.column(name) for name in deferred_fk.columns]
+        single_unique = len(columns) == 1 and self._is_individually_unique(child, columns[0])
+        if single_unique:
+            donors = parent_rows[:]
+            self.factory.rng.shuffle(donors)
+            paired = zip(child_rows, donors)
+        else:
+            paired = ((row, self.factory.rng.choice(parent_rows)) for row in child_rows)
+
+        out: list[tuple[Row, list[tuple[str, Any]]]] = []
+        for row, donor in paired:
+            assigned: list[tuple[str, Any]] = []
+            for child_col, parent_col in zip(deferred_fk.columns, deferred_fk.ref_columns):
+                assigned.append((child_col, donor[parent_col]))
+            out.append((row, assigned))
+        return out
 
     @staticmethod
     def _group_name(group: list[Column]) -> str:

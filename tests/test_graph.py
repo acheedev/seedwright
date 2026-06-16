@@ -1,6 +1,6 @@
 import unittest
 
-from seedwright.graph import CyclicDependencyError, topological_order
+from seedwright.graph import CyclicDependencyError, dependency_plan, topological_order
 from seedwright.model import Column, ForeignKey, Schema, Table
 
 
@@ -44,6 +44,34 @@ class TopoOrderTests(unittest.TestCase):
                           col("a_id", foreign_key=ForeignKey("a", "id"))]))
         with self.assertRaises(CyclicDependencyError):
             topological_order(s)
+
+    def test_dependency_plan_defers_nullable_cycle_edge(self):
+        s = Schema()
+        s.add(Table("a", [col("id", primary_key=True),
+                          col("b_id", nullable=True,
+                              foreign_key=ForeignKey("b", "id"))]))
+        s.add(Table("b", [col("id", primary_key=True),
+                          col("a_id", nullable=False,
+                              foreign_key=ForeignKey("a", "id"))]))
+
+        plan = dependency_plan(s)
+
+        self.assertEqual(plan.order, ["a", "b"])
+        self.assertEqual(len(plan.deferred_fks), 1)
+        self.assertEqual(plan.deferred_fks[0].table, "a")
+        self.assertEqual(plan.deferred_fks[0].columns, ("b_id",))
+
+    def test_dependency_plan_refuses_cycle_with_no_nullable_edge(self):
+        s = Schema()
+        s.add(Table("a", [col("id", primary_key=True),
+                          col("b_id", nullable=False,
+                              foreign_key=ForeignKey("b", "id"))]))
+        s.add(Table("b", [col("id", primary_key=True),
+                          col("a_id", nullable=False,
+                              foreign_key=ForeignKey("a", "id"))]))
+
+        with self.assertRaises(CyclicDependencyError):
+            dependency_plan(s)
 
     def test_unknown_parent_raises(self):
         s = Schema()

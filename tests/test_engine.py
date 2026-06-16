@@ -101,6 +101,19 @@ CREATE TABLE category_paths (
 );
 """
 
+CYCLE_DDL = """
+CREATE TABLE a (
+    id INTEGER PRIMARY KEY,
+    b_id INTEGER REFERENCES b(id),
+    label VARCHAR(80) NOT NULL
+);
+CREATE TABLE b (
+    id INTEGER PRIMARY KEY,
+    a_id INTEGER NOT NULL REFERENCES a(id),
+    label VARCHAR(80) NOT NULL
+);
+"""
+
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
@@ -327,6 +340,33 @@ class EngineTests(unittest.TestCase):
         sink.executescript(COMPOSITE_SELF_FK_DDL)
         sink.executescript(sql)
         self.assertEqual(sink.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_nullable_cross_table_cycle_is_resolved_with_second_pass_update(self):
+        src = self._connect()
+        src.executescript(CYCLE_DDL)
+        schema = self._schema_from(src)
+
+        data = GenerationEngine(
+            schema,
+            per_table={"a": 4, "b": 4},
+            seed=16,
+        ).generate()
+        sql = to_sql(schema, data, SQLiteDialect(self.path))
+
+        self.assertEqual(sql.count("UPDATE "), 4)
+        self.assertTrue(all(row["b_id"] is None for row in data["a"]))
+
+        sink = self._connect()
+        sink.execute("PRAGMA foreign_keys = ON")
+        sink.executescript(CYCLE_DDL)
+        sink.executescript(sql)
+
+        violations = sink.execute("PRAGMA foreign_key_check").fetchall()
+        self.assertEqual(violations, [])
+        self.assertEqual(
+            sink.execute("SELECT COUNT(*) FROM a WHERE b_id IS NOT NULL").fetchone()[0],
+            4,
+        )
 
 
 if __name__ == "__main__":

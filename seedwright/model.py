@@ -10,7 +10,7 @@ a `Schema` — the generator, dependency graph, and emitter never change.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 # Normalized type vocabulary. Every dialect maps its native types into one of
 # these so the generators only ever reason about a small, closed set.
@@ -110,3 +110,32 @@ class Schema:
 
     def __len__(self) -> int:
         return len(self.tables)
+
+
+@dataclass(frozen=True)
+class DeferredForeignKey:
+    """A cross-table FK group inserted as NULL and populated after inserts."""
+
+    table: str
+    columns: tuple[str, ...]
+    ref_table: str
+    ref_columns: tuple[str, ...]
+    constraint_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DeferredUpdate:
+    """A second-pass UPDATE that fills a deferred foreign-key group."""
+
+    table: str
+    key_columns: tuple[str, ...]
+    key_values: tuple[Any, ...]
+    assignments: tuple[tuple[str, Any], ...]
+
+
+class GeneratedData(dict[str, list[dict[str, Any]]]):
+    """Generated rows plus optional second-pass updates for deferred FKs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deferred_updates: list[DeferredUpdate] = []

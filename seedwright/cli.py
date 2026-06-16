@@ -85,10 +85,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Oracle password override; otherwise [oracle].password from config",
     )
     p.add_argument(
-        "--postgres-dsn",
-        help="Postgres connection string override; otherwise [postgres].dsn from config",
-    )
-    p.add_argument(
         "--postgres-schema",
         help="Postgres schema override; otherwise [postgres].schema or public",
     )
@@ -126,7 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--validate-db",
-        help="existing validation target for --apply; changes are rolled back when the dialect supports it",
+        help=(
+            "existing validation target for --apply; changes are rolled back "
+            "when the dialect supports it; Postgres can use "
+            "[postgres].validation_dsn instead"
+        ),
     )
     return p
 
@@ -158,7 +158,7 @@ def _make_dialect(args):
 
     if args.dialect == "postgres":
         postgres_config = dialect_config(config, "postgres")
-        dsn = config_value(postgres_config, "dsn", args.postgres_dsn)
+        dsn = postgres_config.get("dsn")
         schema = config_value(postgres_config, "schema", args.postgres_schema) or "public"
         if not dsn:
             dsn = _postgres_dsn(postgres_config)
@@ -214,6 +214,18 @@ def _postgres_dsn(config) -> str | None:
     )
 
 
+def _validation_target(args) -> str | None:
+    if args.validate_db:
+        return args.validate_db
+    if args.dialect != "postgres":
+        return None
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    return dialect_config(config, "postgres").get("validation_dsn")
+
+
 def _validate_table_rows(schema, per_table: dict[str, int]) -> None:
     unknown = sorted(name for name in per_table if name not in schema.tables)
     if unknown:
@@ -251,12 +263,15 @@ def _filter_schema(schema: Schema, tables_file: str | None) -> tuple[Schema, lis
 def _validate_and_apply(args, dialect, schema, sql: str, total_rows: int) -> int:
     if args.format != "sql":
         raise SystemExit("--apply is only supported with --format sql")
-    if not args.validate_db:
+    validation_target = _validation_target(args)
+    if not validation_target:
+        if args.dialect == "postgres":
+            raise SystemExit("--apply requires --validate-db or [postgres].validation_dsn")
         raise SystemExit("--apply requires --validate-db")
 
-    print(f"seedwright: validating SQL against {args.validate_db}", file=sys.stderr)
+    print(f"seedwright: validating SQL against {validation_target}", file=sys.stderr)
     try:
-        result = dialect.validate_script(args.validate_db, list(schema.tables), sql)
+        result = dialect.validate_script(validation_target, list(schema.tables), sql)
     except NotImplementedError as exc:
         raise SystemExit(str(exc)) from exc
     print(
